@@ -110,6 +110,12 @@ typedef struct
    bool is_in_archive;
 } playlist_path_id_t;
 
+struct nested_playlist_entry
+{
+   char *name;
+   char *playlist;
+};
+
 struct playlist_entry
 {
    char *path;

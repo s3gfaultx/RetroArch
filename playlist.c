@@ -67,6 +67,7 @@ struct content_playlist
    char *default_core_name;
    char *base_content_directory;
 
+   struct nested_playlist_entry *nested_playlists;
    struct playlist_entry *entries;
 
    playlist_manual_scan_record_t scan_record; /* ptr alignment */
@@ -87,6 +88,7 @@ struct content_playlist
 typedef struct
 {
    struct playlist_entry *current_entry;
+   struct nested_playlist_entry *current_nested_playlist_entry;
    char **current_string_val;
    unsigned *current_entry_uint_val;
    enum playlist_label_display_mode *current_meta_label_display_mode_val;
@@ -100,6 +102,7 @@ typedef struct
    unsigned object_depth;
 
    bool in_items;
+   bool in_nested_playlists;
    bool in_subsystem_roms;
    bool capacity_exceeded;
    bool out_of_memory;
@@ -560,6 +563,26 @@ void playlist_get_index(playlist_t *playlist,
       return;
 
    *entry = &playlist->entries[idx];
+}
+
+/**
+ * playlist_free_nested_playlist:
+ * @entry               : Nested playlist entry handle.
+ *
+ * Frees nested playlist entry.
+ **/
+static void playlist_free_nested_playlist(struct nested_playlist_entry *nested_playlist_entry) 
+{
+   if (!nested_playlist_entry)
+      return;
+
+   if (nested_playlist_entry->name)
+      free(nested_playlist_entry->name);
+
+   if (nested_playlist_entry->playlist)
+      free(nested_playlist_entry->playlist);
+
+   nested_playlist_entry->name = NULL;
 }
 
 /**
@@ -1908,6 +1931,49 @@ void playlist_write_file(playlist_t *playlist)
       }
 
       rjsonwriter_add_spaces(writer, 2);
+      rjsonwriter_add_string(writer, "nested_playlists");
+      rjsonwriter_raw(writer, ":", 1);
+      rjsonwriter_raw(writer, " ", 1);
+      rjsonwriter_raw(writer, "[", 1);
+      rjsonwriter_raw(writer, "\n", 1);
+
+      for (i = 0, len = RBUF_LEN(playlist->nested_playlists); i < len; i++)
+      {
+         rjsonwriter_add_spaces(writer, 4);
+         rjsonwriter_raw(writer, "{", 1);
+
+         rjsonwriter_raw(writer, "\n", 1);
+         rjsonwriter_add_spaces(writer, 6);
+         rjsonwriter_add_string(writer, "name");
+         rjsonwriter_raw(writer, ":", 1);
+         rjsonwriter_raw(writer, " ", 1);
+         rjsonwriter_add_string(writer, playlist->nested_playlists[i].name);
+         
+         rjsonwriter_raw(writer, ",", 1);
+         rjsonwriter_raw(writer, "\n", 1);
+
+         rjsonwriter_add_spaces(writer, 6);
+         rjsonwriter_add_string(writer, "playlist");
+         rjsonwriter_raw(writer, ":", 1);
+         rjsonwriter_raw(writer, " ", 1);
+         rjsonwriter_add_string(writer, playlist->nested_playlists[i].playlist);         
+
+         rjsonwriter_raw(writer, "\n", 1);
+
+         rjsonwriter_add_spaces(writer, 4);
+         rjsonwriter_raw(writer, "}", 1);
+
+         if (i < len - 1)
+            rjsonwriter_raw(writer, ",", 1);
+
+         rjsonwriter_raw(writer, "\n", 1);
+      }
+
+      rjsonwriter_add_spaces(writer, 2);
+      rjsonwriter_raw(writer, "],", 2);
+      rjsonwriter_raw(writer, "\n", 1);
+
+      rjsonwriter_add_spaces(writer, 2);
       rjsonwriter_add_string(writer, "items");
       rjsonwriter_raw(writer, ":", 1);
       rjsonwriter_raw(writer, " ", 1);
@@ -2105,6 +2171,19 @@ void playlist_free(playlist_t *playlist)
       free(playlist->scan_record.dat_file_path);
    playlist->scan_record.dat_file_path = NULL;
 
+   if (playlist->nested_playlists)
+   {
+      for (i = 0, len = RBUF_LEN(playlist->nested_playlists); i < len; i++)
+      {
+         struct nested_playlist_entry *nested_playlist_entry = &playlist->nested_playlists[i];
+
+         if (nested_playlist_entry)
+            playlist_free_nested_playlist(nested_playlist_entry);
+      }
+
+      RBUF_FREE(playlist->nested_playlists);      
+   }
+
    if (playlist->entries)
    {
       for (i = 0, len = RBUF_LEN(playlist->entries); i < len; i++)
@@ -2241,6 +2320,43 @@ static bool JSONStartObjectHandler(void *context)
       }
    }
 
+   if (      pCtx->in_nested_playlists
+         && (pCtx->object_depth == 2))
+   {
+      if (
+            (pCtx->array_depth == 1) 
+         && !pCtx->capacity_exceeded)
+      {
+         size_t len = RBUF_LEN(pCtx->playlist->nested_playlists);
+         if (len < pCtx->playlist->config.capacity)
+         {
+            /* Allocate memory to fit one more item but don't resize the
+             * buffer just yet, wait until JSONEndObjectHandler for that */
+            if (!RBUF_TRYFIT(pCtx->playlist->nested_playlists, len + 1))
+            {
+               pCtx->out_of_memory     = true;
+               return false;
+            }
+            pCtx->current_nested_playlist_entry = &pCtx->playlist->nested_playlists[len];
+            memset(pCtx->current_nested_playlist_entry, 0, sizeof(*pCtx->current_nested_playlist_entry));
+         }
+         else
+         {
+            /* Hit max item limit.
+             * Note: We can't just abort here, since there may
+             * be more metadata to read at the end of the file... */
+            RARCH_WARN("JSON file contains more nested playlists than current playlist capacity. Excess entries will be discarded.\n");
+            pCtx->capacity_exceeded  = true;
+            pCtx->current_entry      = NULL;
+            /* In addition, since we are discarding excess entries,
+             * the playlist must be flagged as being modified
+             * (i.e. the playlist is not the same as when it was
+             * last saved to disk...) */
+            pCtx->playlist->modified = true;
+         }
+      }
+   }
+
    return true;
 }
 
@@ -2255,6 +2371,13 @@ static bool JSONEndObjectHandler(void *context)
             && !pCtx->capacity_exceeded)
          RBUF_RESIZE(pCtx->playlist->entries,
                RBUF_LEN(pCtx->playlist->entries) + 1);
+   } else if (     pCtx->in_nested_playlists 
+         && pCtx->object_depth == 2)
+   {
+      if (     (pCtx->array_depth == 1) 
+            && !pCtx->capacity_exceeded)
+         RBUF_RESIZE(pCtx->playlist->nested_playlists,
+               RBUF_LEN(pCtx->playlist->nested_playlists) + 1);
    }
 
    pCtx->object_depth--;
@@ -2296,6 +2419,21 @@ static bool JSONStringHandler(void *context, const char *pValue, size_t length)
          }
       }
    }
+   else if ((pCtx->in_nested_playlists)
+         && (pCtx->object_depth == 2))
+   {
+      if (pCtx->array_depth == 1)
+      {
+         if (     pCtx->current_string_val 
+               && length 
+               && !string_is_empty(pValue))
+         {
+            if (*pCtx->current_string_val)
+                free(*pCtx->current_string_val);
+             *pCtx->current_string_val = strdup(pValue);
+         }
+      }
+   }   
    else if (pCtx->object_depth == 1)
    {
       if (pCtx->array_depth == 0)
@@ -2379,7 +2517,7 @@ static bool JSONObjectMemberHandler(void *context, const char *pValue, size_t le
 {
    JSONContext *pCtx = (JSONContext *)context;
 
-   if (     pCtx->in_items 
+   if (     pCtx->in_items
          && (pCtx->object_depth == 2))
    {
       if (pCtx->array_depth == 1)
@@ -2451,6 +2589,34 @@ static bool JSONObjectMemberHandler(void *context, const char *pValue, size_t le
          }
       }
    }
+   else if (     (pCtx->in_nested_playlists)
+         && (pCtx->object_depth == 2))
+   {
+      if (pCtx->array_depth == 1)
+      {
+         /* Something went wrong */
+         if (pCtx->current_string_val)
+            return false;
+
+         if (length && !pCtx->capacity_exceeded)
+         {
+            pCtx->current_string_val     = NULL;
+            pCtx->current_entry_uint_val = NULL;
+            pCtx->in_subsystem_roms      = false;
+            switch (pValue[0])
+            {
+               case 'n':
+                     if (string_is_equal(pValue, "name"))
+                        pCtx->current_string_val = &pCtx->current_nested_playlist_entry->name;
+                     break;
+               case 'p':
+                     if (string_is_equal(pValue, "playlist"))
+                        pCtx->current_string_val = &pCtx->current_nested_playlist_entry->playlist;
+                     break;                     
+            }
+         }
+      }
+   }   
    else if ((pCtx->object_depth == 1)
          && (pCtx->array_depth  == 0)
          && length)
@@ -2462,6 +2628,7 @@ static bool JSONObjectMemberHandler(void *context, const char *pValue, size_t le
       pCtx->current_meta_sort_mode_val            = NULL;
       pCtx->current_meta_bool_val                 = NULL;
       pCtx->in_items                              = false;
+      pCtx->in_nested_playlists                   = false;
 
       switch (pValue[0])
       {
@@ -2479,6 +2646,9 @@ static bool JSONObjectMemberHandler(void *context, const char *pValue, size_t le
             if (string_is_equal(pValue, "items"))
                pCtx->in_items = true;
             break;
+         case 'n':
+            if (string_is_equal(pValue, "nested_playlists"))
+               pCtx->in_nested_playlists = true;                     
          case 'l':
             if (string_is_equal(pValue,      "label_display_mode"))
                pCtx->current_meta_label_display_mode_val = &pCtx->playlist->label_display_mode;
@@ -2879,6 +3049,7 @@ playlist_t *playlist_init(const playlist_config_t *config)
    playlist->default_core_name      = NULL;
    playlist->default_core_path      = NULL;
    playlist->base_content_directory = NULL;
+   playlist->nested_playlists       = NULL;
    playlist->entries                = NULL;
    playlist->label_display_mode     = LABEL_DISPLAY_MODE_DEFAULT;
    playlist->right_thumbnail_mode   = PLAYLIST_THUMBNAIL_MODE_DEFAULT;
